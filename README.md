@@ -36,7 +36,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Each result page also renders a simple tube schematic showing the current mixture composition as stacked liquid layers with ml tick marks, and the SVG can be downloaded for documentation or lab notes.
+Each result page also renders a simple tube schematic showing the current mixture composition as stacked liquid layers with ml tick marks. The tube legend wraps long component names and the SVG can be downloaded for documentation or lab notes.
 
 ## Repository layout
 

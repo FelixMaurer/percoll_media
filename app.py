@@ -71,25 +71,75 @@ def nice_tick_step(volume_ml: float) -> float:
     return candidates[-1]
 
 
-def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
-    """Create a simple SVG tube with stacked component fills and volume marks."""
+def _svg_tspans(lines, x, y, *, font_size=14, line_height=17, fill="#263238", anchor="start"):
+    """Return SVG <text> with multiple tspans for wrapped labels."""
+    escaped_lines = [escape(line) for line in lines]
+    tspans = []
+    for i, line in enumerate(escaped_lines):
+        dy = 0 if i == 0 else line_height
+        tspans.append(f'<tspan x="{x}" dy="{dy}">{line}</tspan>')
+    return (
+        f'<text x="{x}" y="{y}" text-anchor="{anchor}" font-size="{font_size}" '
+        f'font-family="Arial, sans-serif" fill="{fill}">' + "".join(tspans) + "</text>"
+    )
+
+
+def _wrap_label(label: str, max_chars: int = 48) -> list[str]:
+    """Simple word wrap for SVG legend labels."""
+    words = label.split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= max_chars:
+            current += " " + word
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def tube_svg(result: MixResult, width: int = 760, height: int | None = None) -> str:
+    """Create a responsive SVG tube with stacked component fills and volume marks.
+
+    The legend area is deliberately wide and wraps labels so component names do
+    not get clipped in Streamlit.
+    """
     total = max(result.target_volume_ml, 1e-9)
     colors = [
         '#c94f4f', '#4f8cc9', '#67b567', '#d4a64a', '#9b6fcf', '#53b7b0',
         '#e07f39', '#8d9aa5', '#de5d9e', '#62a04a'
     ]
-    left_margin = 86
-    tube_x = 115
-    tube_y = 30
-    tube_w = 120
+
+    # Layout
+    tube_x = 130
+    tube_y = 46
+    tube_w = 126
     tube_h = 500
-    bottom_r = tube_w / 2
-    body_h = tube_h - bottom_r
-    right_legend_x = 275
+    legend_x = 320
+    legend_text_x = legend_x + 26
+    legend_max_chars = 46
     tick_len_major = 14
     tick_len_minor = 8
     label_fs = 15
     title_fs = 20
+
+    # Precompute wrapped legend lines and needed height.
+    legend_blocks = []
+    for comp in result.components:
+        frac_pct = 100 * comp.volume_ml / total if total > 0 else 0
+        label = f"{comp.name}: {comp.volume_ml:.4g} ml ({frac_pct:.1f}%)"
+        legend_blocks.append(_wrap_label(label, legend_max_chars))
+
+    legend_line_height = 17
+    legend_block_gap = 9
+    legend_height = 42 + sum(len(lines) * legend_line_height + legend_block_gap for lines in legend_blocks) + 28
+    if result.apparent_density_g_ml is not None:
+        legend_height += 22
+    if height is None:
+        height = int(max(640, tube_y + tube_h + 76, tube_y + legend_height + 40))
 
     def y_for_volume(v: float) -> float:
         frac = min(max(v / total, 0.0), 1.0)
@@ -98,9 +148,11 @@ def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
     clip_id = f"tubeclip_{abs(hash((result.title, result.target_volume_ml, len(result.components)))) % 10**8}"
 
     svg = []
-    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">')
+    # width="100%" makes it scale to the available Streamlit column, but the
+    # viewBox preserves the wider legend canvas.
+    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="{height}" viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMin meet">')
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="{width/2}" y="22" text-anchor="middle" font-size="{title_fs}" font-family="Arial, sans-serif" font-weight="bold">{escape(result.title)}</text>')
+    svg.append(f'<text x="{width/2}" y="24" text-anchor="middle" font-size="{title_fs}" font-family="Arial, sans-serif" font-weight="bold">{escape(result.title)}</text>')
     svg.append(f'<defs><clipPath id="{clip_id}"><rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}"/></clipPath></defs>')
 
     # Tube background
@@ -119,21 +171,21 @@ def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
         color = colors[idx % len(colors)]
         svg.append(f'<rect x="{tube_x}" y="{section_y}" width="{tube_w}" height="{section_h}" fill="{color}" clip-path="url(#{clip_id})"/>')
 
-    # Top meniscus shine
-    svg.append(f'<rect x="{tube_x + 14}" y="{tube_y + 18}" width="18" height="{tube_h - 36}" rx="9" fill="#ffffff" opacity="0.32" clip-path="url(#{clip_id})"/>')
+    # Shine
+    svg.append(f'<rect x="{tube_x + 15}" y="{tube_y + 18}" width="18" height="{tube_h - 36}" rx="9" fill="#ffffff" opacity="0.32" clip-path="url(#{clip_id})"/>')
 
     # Component boundary lines
     running = 0.0
-    for idx, comp in enumerate(result.components[:-1]):
+    for comp in result.components[:-1]:
         running += comp.volume_ml
         y = y_for_volume(running)
         if tube_y < y < tube_y + tube_h:
-            svg.append(f'<line x1="{tube_x+6}" x2="{tube_x+tube_w-6}" y1="{y}" y2="{y}" stroke="#ffffff" opacity="0.7" stroke-width="2" clip-path="url(#{clip_id})"/>')
+            svg.append(f'<line x1="{tube_x+7}" x2="{tube_x+tube_w-7}" y1="{y}" y2="{y}" stroke="#ffffff" opacity="0.7" stroke-width="2" clip-path="url(#{clip_id})"/>')
 
-    # Tube outline again for crisp edge
+    # Tube outline
     svg.append(f'<rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}" fill="none" stroke="#37474f" stroke-width="4"/>')
 
-    # Major and minor volume marks
+    # Volume marks
     major = nice_tick_step(total)
     minor = major / 2 if major >= 0.2 else major
     n_minor = int(total / minor)
@@ -149,28 +201,26 @@ def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
         if is_major:
             label = f"{v:.0f}" if major >= 1 else f"{v:.1f}"
             svg.append(f'<text x="{tube_x - tick_len - 6}" y="{y + 5}" text-anchor="end" font-size="{label_fs}" font-family="Arial, sans-serif" fill="#37474f">{label}</text>')
-    svg.append(f'<text x="{left_margin/2 + 10}" y="{tube_y + tube_h/2}" transform="rotate(-90 {left_margin/2 + 10} {tube_y + tube_h/2})" text-anchor="middle" font-size="16" font-family="Arial, sans-serif" fill="#37474f">volume [ml]</text>')
 
-    # Total label
+    axis_x = 54
+    svg.append(f'<text x="{axis_x}" y="{tube_y + tube_h/2}" transform="rotate(-90 {axis_x} {tube_y + tube_h/2})" text-anchor="middle" font-size="16" font-family="Arial, sans-serif" fill="#37474f">volume [ml]</text>')
     svg.append(f'<text x="{tube_x + tube_w/2}" y="{tube_y + tube_h + 32}" text-anchor="middle" font-size="16" font-family="Arial, sans-serif" fill="#37474f">total = {total:.4g} ml</text>')
 
-    # Legend
-    svg.append(f'<text x="{right_legend_x}" y="{tube_y + 8}" font-size="17" font-family="Arial, sans-serif" font-weight="bold" fill="#263238">Mixture</text>')
-    legend_y = tube_y + 34
-    for idx, comp in enumerate(result.components):
+    # Legend with wrapping
+    svg.append(f'<text x="{legend_x}" y="{tube_y + 8}" font-size="18" font-family="Arial, sans-serif" font-weight="bold" fill="#263238">Mixture</text>')
+    legend_y = tube_y + 36
+    for idx, lines in enumerate(legend_blocks):
         color = colors[idx % len(colors)]
-        frac_pct = 100 * comp.volume_ml / total if total > 0 else 0
-        label = f"{comp.name}: {comp.volume_ml:.4g} ml ({frac_pct:.1f}%)"
-        svg.append(f'<rect x="{right_legend_x}" y="{legend_y - 12}" width="16" height="16" fill="{color}" stroke="#455a64" stroke-width="1"/>')
-        svg.append(f'<text x="{right_legend_x + 24}" y="{legend_y}" font-size="14" font-family="Arial, sans-serif" fill="#263238">{escape(label)}</text>')
-        legend_y += 24
+        svg.append(f'<rect x="{legend_x}" y="{legend_y - 13}" width="16" height="16" fill="{color}" stroke="#455a64" stroke-width="1"/>')
+        svg.append(_svg_tspans(lines, legend_text_x, legend_y, font_size=14, line_height=legend_line_height))
+        legend_y += len(lines) * legend_line_height + legend_block_gap
+
     if result.apparent_density_g_ml is not None:
         density_txt = f"density = {result.apparent_density_g_ml:.6f} g/ml"
-        svg.append(f'<text x="{right_legend_x}" y="{legend_y + 8}" font-size="14" font-family="Arial, sans-serif" fill="#263238">{escape(density_txt)}</text>')
+        svg.append(f'<text x="{legend_x}" y="{legend_y + 8}" font-size="14" font-family="Arial, sans-serif" fill="#263238">{escape(density_txt)}</text>')
 
     svg.append('</svg>')
     return ''.join(svg)
-
 
 def render_tube_visualization(result: MixResult):
     st.subheader("Tube visualization")
@@ -179,7 +229,7 @@ def render_tube_visualization(result: MixResult):
     # Render SVG as HTML instead of st.image(). Some Streamlit/Pillow
     # versions try to decode SVG bytes as a raster image and fail with:
     # "cannot identify image file <_io.BytesIO ...>".
-    components.html(svg, height=660, scrolling=False)
+    components.html(f'<div style="width:100%; overflow-x:auto;">{svg}</div>', height=720, scrolling=True)
     st.download_button(
         "Download tube SVG",
         svg.encode('utf-8'),
@@ -196,7 +246,7 @@ def render_result(result: MixResult):
         c2.metric("Calculated density", f"{result.apparent_density_g_ml:.6f} g/ml")
     c3.metric("Number of components", str(len(result.components)))
 
-    viz_col, table_col = st.columns([1, 1.3])
+    viz_col, table_col = st.columns([1.35, 1.15])
     with viz_col:
         render_tube_visualization(result)
 
