@@ -93,6 +93,11 @@ B = 1 - P - O
 
 where `P` is the fixed IPS/Percoll-containing fraction, `O` is the OptiPrep fraction, and `B` is the PBS fraction.
 
+
+### Tube visualization implementation
+
+The tube graphic is generated as inline SVG and rendered through `streamlit.components.v1.html()`. This avoids Streamlit/Pillow trying to decode SVG bytes as a raster image on some installations.
+
 ## Notes for future extensions
 
 Useful next additions:

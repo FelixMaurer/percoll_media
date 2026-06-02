@@ -6,6 +6,7 @@ from html import escape
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from media_mixer.calculations import (
     Component,
@@ -119,7 +120,7 @@ def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
         svg.append(f'<rect x="{tube_x}" y="{section_y}" width="{tube_w}" height="{section_h}" fill="{color}" clip-path="url(#{clip_id})"/>')
 
     # Top meniscus shine
-    svg.append(f'<rect x="{tube_x + 14}" y="{tube_y + 18}" width="18" height="{tube_h - 36}" rx="9" fill="rgba(255,255,255,0.32)" clip-path="url(#{clip_id})"/>')
+    svg.append(f'<rect x="{tube_x + 14}" y="{tube_y + 18}" width="18" height="{tube_h - 36}" rx="9" fill="#ffffff" opacity="0.32" clip-path="url(#{clip_id})"/>')
 
     # Component boundary lines
     running = 0.0
@@ -127,7 +128,7 @@ def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
         running += comp.volume_ml
         y = y_for_volume(running)
         if tube_y < y < tube_y + tube_h:
-            svg.append(f'<line x1="{tube_x+6}" x2="{tube_x+tube_w-6}" y1="{y}" y2="{y}" stroke="rgba(255,255,255,0.7)" stroke-width="2" clip-path="url(#{clip_id})"/>')
+            svg.append(f'<line x1="{tube_x+6}" x2="{tube_x+tube_w-6}" y1="{y}" y2="{y}" stroke="#ffffff" opacity="0.7" stroke-width="2" clip-path="url(#{clip_id})"/>')
 
     # Tube outline again for crisp edge
     svg.append(f'<rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}" fill="none" stroke="#37474f" stroke-width="4"/>')
@@ -175,7 +176,10 @@ def render_tube_visualization(result: MixResult):
     st.subheader("Tube visualization")
     st.caption("Stacked by component volume. Volume marks use the final/target total volume.")
     svg = tube_svg(result)
-    st.image(svg.encode('utf-8'))
+    # Render SVG as HTML instead of st.image(). Some Streamlit/Pillow
+    # versions try to decode SVG bytes as a raster image and fail with:
+    # "cannot identify image file <_io.BytesIO ...>".
+    components.html(svg, height=660, scrolling=False)
     st.download_button(
         "Download tube SVG",
         svg.encode('utf-8'),
