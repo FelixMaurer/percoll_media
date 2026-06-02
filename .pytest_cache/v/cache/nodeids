@@ -1,0 +1,8 @@
+[
+  "tests/test_calculations.py::test_blood_mode_volume_balance",
+  "tests/test_calculations.py::test_density_correction",
+  "tests/test_calculations.py::test_ips74_empirical_sums_to_one",
+  "tests/test_calculations.py::test_sdm_ips_pbs_example",
+  "tests/test_calculations.py::test_ternary",
+  "tests/test_calculations.py::test_two_endpoint_mix"
+]

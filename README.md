@@ -14,6 +14,7 @@ The app implements the calculation branches gathered from the uploaded MATLAB sc
 - Ternary IPS/Percoll + OptiPrep + PBS mixing
 - Density correction by adding one stock
 - Low/high gradient endpoint helper
+- Tube visualization with stacked component fills and volume marks
 
 ## Scientific assumptions
 
@@ -34,6 +35,8 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+Each result page also renders a simple tube schematic showing the current mixture composition as stacked liquid layers with ml tick marks, and the SVG can be downloaded for documentation or lab notes.
 
 ## Repository layout
 

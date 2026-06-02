@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import io
-import textwrap
 from datetime import datetime
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -57,6 +57,133 @@ def result_to_df(result: MixResult) -> pd.DataFrame:
     return df
 
 
+def nice_tick_step(volume_ml: float) -> float:
+    """Choose a readable major tick spacing in ml."""
+    candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000]
+    if volume_ml <= 0:
+        return 1.0
+    target_marks = 6
+    ideal = volume_ml / target_marks
+    for step in candidates:
+        if step >= ideal:
+            return step
+    return candidates[-1]
+
+
+def tube_svg(result: MixResult, width: int = 440, height: int = 640) -> str:
+    """Create a simple SVG tube with stacked component fills and volume marks."""
+    total = max(result.target_volume_ml, 1e-9)
+    colors = [
+        '#c94f4f', '#4f8cc9', '#67b567', '#d4a64a', '#9b6fcf', '#53b7b0',
+        '#e07f39', '#8d9aa5', '#de5d9e', '#62a04a'
+    ]
+    left_margin = 86
+    tube_x = 115
+    tube_y = 30
+    tube_w = 120
+    tube_h = 500
+    bottom_r = tube_w / 2
+    body_h = tube_h - bottom_r
+    right_legend_x = 275
+    tick_len_major = 14
+    tick_len_minor = 8
+    label_fs = 15
+    title_fs = 20
+
+    def y_for_volume(v: float) -> float:
+        frac = min(max(v / total, 0.0), 1.0)
+        return tube_y + tube_h - frac * tube_h
+
+    clip_id = f"tubeclip_{abs(hash((result.title, result.target_volume_ml, len(result.components)))) % 10**8}"
+
+    svg = []
+    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">')
+    svg.append('<rect width="100%" height="100%" fill="white"/>')
+    svg.append(f'<text x="{width/2}" y="22" text-anchor="middle" font-size="{title_fs}" font-family="Arial, sans-serif" font-weight="bold">{escape(result.title)}</text>')
+    svg.append(f'<defs><clipPath id="{clip_id}"><rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}"/></clipPath></defs>')
+
+    # Tube background
+    svg.append(f'<rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}" fill="#f8fafc" stroke="#455a64" stroke-width="4"/>')
+
+    # Fills
+    running = 0.0
+    for idx, comp in enumerate(result.components):
+        if comp.volume_ml <= 0:
+            continue
+        y0 = y_for_volume(running)
+        running += comp.volume_ml
+        y1 = y_for_volume(running)
+        section_y = y1
+        section_h = max(y0 - y1, 0)
+        color = colors[idx % len(colors)]
+        svg.append(f'<rect x="{tube_x}" y="{section_y}" width="{tube_w}" height="{section_h}" fill="{color}" clip-path="url(#{clip_id})"/>')
+
+    # Top meniscus shine
+    svg.append(f'<rect x="{tube_x + 14}" y="{tube_y + 18}" width="18" height="{tube_h - 36}" rx="9" fill="rgba(255,255,255,0.32)" clip-path="url(#{clip_id})"/>')
+
+    # Component boundary lines
+    running = 0.0
+    for idx, comp in enumerate(result.components[:-1]):
+        running += comp.volume_ml
+        y = y_for_volume(running)
+        if tube_y < y < tube_y + tube_h:
+            svg.append(f'<line x1="{tube_x+6}" x2="{tube_x+tube_w-6}" y1="{y}" y2="{y}" stroke="rgba(255,255,255,0.7)" stroke-width="2" clip-path="url(#{clip_id})"/>')
+
+    # Tube outline again for crisp edge
+    svg.append(f'<rect x="{tube_x}" y="{tube_y}" width="{tube_w}" height="{tube_h}" rx="{tube_w/2}" ry="{tube_w/2}" fill="none" stroke="#37474f" stroke-width="4"/>')
+
+    # Major and minor volume marks
+    major = nice_tick_step(total)
+    minor = major / 2 if major >= 0.2 else major
+    n_minor = int(total / minor)
+    for i in range(n_minor + 1):
+        v = i * minor
+        if v > total + 1e-9:
+            break
+        y = y_for_volume(v)
+        is_major = abs((v / major) - round(v / major)) < 1e-9
+        tick_len = tick_len_major if is_major else tick_len_minor
+        stroke = '#607d8b' if is_major else '#b0bec5'
+        svg.append(f'<line x1="{tube_x - tick_len}" x2="{tube_x}" y1="{y}" y2="{y}" stroke="{stroke}" stroke-width="2"/>')
+        if is_major:
+            label = f"{v:.0f}" if major >= 1 else f"{v:.1f}"
+            svg.append(f'<text x="{tube_x - tick_len - 6}" y="{y + 5}" text-anchor="end" font-size="{label_fs}" font-family="Arial, sans-serif" fill="#37474f">{label}</text>')
+    svg.append(f'<text x="{left_margin/2 + 10}" y="{tube_y + tube_h/2}" transform="rotate(-90 {left_margin/2 + 10} {tube_y + tube_h/2})" text-anchor="middle" font-size="16" font-family="Arial, sans-serif" fill="#37474f">volume [ml]</text>')
+
+    # Total label
+    svg.append(f'<text x="{tube_x + tube_w/2}" y="{tube_y + tube_h + 32}" text-anchor="middle" font-size="16" font-family="Arial, sans-serif" fill="#37474f">total = {total:.4g} ml</text>')
+
+    # Legend
+    svg.append(f'<text x="{right_legend_x}" y="{tube_y + 8}" font-size="17" font-family="Arial, sans-serif" font-weight="bold" fill="#263238">Mixture</text>')
+    legend_y = tube_y + 34
+    for idx, comp in enumerate(result.components):
+        color = colors[idx % len(colors)]
+        frac_pct = 100 * comp.volume_ml / total if total > 0 else 0
+        label = f"{comp.name}: {comp.volume_ml:.4g} ml ({frac_pct:.1f}%)"
+        svg.append(f'<rect x="{right_legend_x}" y="{legend_y - 12}" width="16" height="16" fill="{color}" stroke="#455a64" stroke-width="1"/>')
+        svg.append(f'<text x="{right_legend_x + 24}" y="{legend_y}" font-size="14" font-family="Arial, sans-serif" fill="#263238">{escape(label)}</text>')
+        legend_y += 24
+    if result.apparent_density_g_ml is not None:
+        density_txt = f"density = {result.apparent_density_g_ml:.6f} g/ml"
+        svg.append(f'<text x="{right_legend_x}" y="{legend_y + 8}" font-size="14" font-family="Arial, sans-serif" fill="#263238">{escape(density_txt)}</text>')
+
+    svg.append('</svg>')
+    return ''.join(svg)
+
+
+def render_tube_visualization(result: MixResult):
+    st.subheader("Tube visualization")
+    st.caption("Stacked by component volume. Volume marks use the final/target total volume.")
+    svg = tube_svg(result)
+    st.image(svg.encode('utf-8'))
+    st.download_button(
+        "Download tube SVG",
+        svg.encode('utf-8'),
+        file_name=f"{safe_name(result.title)}_tube_{datetime.now().strftime('%Y%m%d_%H%M')}.svg",
+        mime='image/svg+xml',
+    )
+
+
 def render_result(result: MixResult):
     st.subheader(result.title)
     c1, c2, c3 = st.columns(3)
@@ -65,16 +192,22 @@ def render_result(result: MixResult):
         c2.metric("Calculated density", f"{result.apparent_density_g_ml:.6f} g/ml")
     c3.metric("Number of components", str(len(result.components)))
 
+    viz_col, table_col = st.columns([1, 1.3])
+    with viz_col:
+        render_tube_visualization(result)
+
     df = result_to_df(result)
-    st.dataframe(
-        df.style.format({
-            "Volume [ml]": "{:.6f}",
-            "Density [g/ml]": "{:.6f}",
-            "Mass [g]": "{:.6f}",
-            "v/v fraction": "{:.6f}",
-        }, na_rep=""),
-        use_container_width=True,
-    )
+    with table_col:
+        st.subheader("Component table")
+        st.dataframe(
+            df.style.format({
+                "Volume [ml]": "{:.6f}",
+                "Density [g/ml]": "{:.6f}",
+                "Mass [g]": "{:.6f}",
+                "v/v fraction": "{:.6f}",
+            }, na_rep=""),
+            use_container_width=True,
+        )
 
     with st.expander("Calculation checks / internal fractions", expanded=False):
         if result.checks:
