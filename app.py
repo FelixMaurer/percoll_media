@@ -378,6 +378,13 @@ def make_paired_endpoint_protocol_text(recipe_df: pd.DataFrame, totals_df: pd.Da
             lines.append(f"  - IPS:       {row['IPS volume [ml]']:.6f} ml = {row['IPS mass [g]']:.6f} g")
             lines.append(f"  - OptiPrep:  {row['OptiPrep volume [ml]']:.6f} ml = {row['OptiPrep mass [g]']:.6f} g")
             lines.append(f"  - PBS:       {row['PBS volume [ml]']:.6f} ml = {row['PBS mass [g]']:.6f} g")
+            if "RBC suspension volume [ml]" in row.index and pd.notna(row["RBC suspension volume [ml]"]):
+                lines.append(
+                    f"  - RBC suspension sample: {row['RBC suspension volume [ml]']:.6f} ml "
+                    f"≈ {row['RBC suspension mass estimate [g]']:.6f} g "
+                    f"(target RBC {row['Target RBC fraction [%]']:.3f}%, hct {row['Sample hematocrit']:.6f})"
+                )
+                lines.append(f"    contains RBC volume: {row['RBC volume [ml]']:.6f} ml")
         else:
             lines.append(f"  - Warning: {row['Warning']}")
     lines.append("")
@@ -715,17 +722,102 @@ with tabs[9]:
             0.5, 2.0, DEFAULTS["rho_pbs"], 0.0001, format="%.6f", key="paired_rho_pbs"
         )
 
+    st.subheader("Optional RBC suspension addition")
+    include_rbc = st.checkbox(
+        "Include an RBC/blood suspension in every endpoint mixture",
+        value=False,
+        key="paired_include_rbc",
+        help=(
+            "When enabled, the endpoint volume is interpreted as the final tube mixture volume "
+            "including RBCs. The density target is applied to the continuous liquid phase after "
+            "the suspension medium has been added."
+        ),
+    )
+
+    if include_rbc:
+        b1, b2, b3 = st.columns([1.15, 1, 1])
+        with b1:
+            rbc_targets_raw = st.text_area(
+                "Target final RBC volume fraction(s)",
+                "3",
+                help=(
+                    "Enter one value for all tubes or one value per IPS condition. "
+                    "3 means 3%; 0.03 also works. Example: 2, 3, 4, 5"
+                ),
+                key="paired_rbc_targets",
+            )
+            ips_basis_label = st.selectbox(
+                "Interpret requested IPS fractions as",
+                ["fraction of formulated carrier, excluding RBC suspension", "fraction of final total tube mixture"],
+                index=0,
+                key="paired_ips_basis",
+                help=(
+                    "Carrier basis is usually the practical choice: the requested 50%, 60%, ... "
+                    "refer to the IPS fraction within the IPS/OptiPrep/PBS carrier before the RBC suspension is added."
+                ),
+            )
+            ips_basis = "carrier_excluding_sample" if ips_basis_label.startswith("fraction of formulated carrier") else "final_total_mixture"
+        with b2:
+            sample_hct = st.number_input(
+                "Hematocrit of RBC suspension",
+                0.0001, 0.99, 0.45, 0.01, format="%.6f", key="paired_sample_hct",
+                help="RBC volume fraction inside the stock RBC/blood suspension."
+            )
+            sample_medium_choice = st.selectbox(
+                "Suspension medium",
+                ["PBS", "plasma", "custom"],
+                index=0,
+                key="paired_sample_medium_choice",
+            )
+            if sample_medium_choice == "PBS":
+                sample_liquid_name = "sample PBS"
+                sample_rho_default = DEFAULTS["rho_pbs"]
+            elif sample_medium_choice == "plasma":
+                sample_liquid_name = "sample plasma"
+                sample_rho_default = DEFAULTS["rho_plasma"]
+            else:
+                sample_liquid_name = "sample liquid"
+                sample_rho_default = DEFAULTS["rho_plasma"]
+        with b3:
+            rho_sample_liquid = st.number_input(
+                "ρ suspension medium [g/ml]",
+                0.5, 2.0, sample_rho_default, 0.0001, format="%.6f", key="paired_rho_sample_liquid",
+                help="Density of the non-RBC liquid carried in by the RBC suspension."
+            )
+            rho_rbc_for_mass = st.number_input(
+                "ρ RBC estimate for sample mass [g/ml]",
+                0.5, 2.0, 1.1000, 0.0001, format="%.6f", key="paired_rho_rbc_mass",
+                help="Only used to estimate the mass of the RBC suspension sample."
+            )
+    else:
+        rbc_targets_raw = "0"
+        sample_hct = 0.45
+        rho_sample_liquid = DEFAULTS["rho_plasma"]
+        rho_rbc_for_mass = 1.1000
+        sample_liquid_name = "sample liquid"
+        ips_basis = "carrier_excluding_sample"
+
     st.subheader("Available stock volumes")
-    a1, a2, a3 = st.columns(3)
+    if include_rbc:
+        a1, a2, a3, a4 = st.columns(4)
+    else:
+        a1, a2, a3 = st.columns(3)
+        a4 = None
     with a1:
         avail_ips = st.number_input("Available IPS [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_ips")
     with a2:
         avail_opt = st.number_input("Available OptiPrep medium [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_opt")
     with a3:
         avail_pbs = st.number_input("Available PBS [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_pbs")
+    if include_rbc and a4 is not None:
+        with a4:
+            avail_sample = st.number_input("Available RBC suspension [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_sample")
+    else:
+        avail_sample = 0.0
 
     try:
         ips_fractions = parse_fraction_list(fractions_raw)
+        rbc_fractions = parse_fraction_list(rbc_targets_raw) if include_rbc else [0.0]
         batch = paired_gradient_endpoint_batch(
             endpoint_volume_ml=endpoint_volume,
             ips_fractions=ips_fractions,
@@ -735,6 +827,13 @@ with tabs[9]:
             rho_optiprep=rho_opt,
             rho_pbs=rho_pbs,
             excess_fraction=excess_percent / 100.0,
+            include_rbc_suspension=include_rbc,
+            target_rbc_fractions=rbc_fractions,
+            sample_hematocrit=sample_hct,
+            rho_sample_liquid=rho_sample_liquid,
+            sample_liquid_name=sample_liquid_name,
+            rho_rbc_for_mass=rho_rbc_for_mass,
+            ips_fraction_basis=ips_basis,
         )
         recipe_df = pd.DataFrame(batch["recipe_rows"])
         totals_df = pd.DataFrame(batch["total_rows"])
@@ -750,6 +849,10 @@ with tabs[9]:
         f1.metric("Low endpoint feasible IPS", f"{100*low_interval['p_min']:.2f}–{100*low_interval['p_max']:.2f}%")
         f2.metric("High endpoint feasible IPS", f"{100*high_interval['p_min']:.2f}–{100*high_interval['p_max']:.2f}%")
         f3.metric("Feasible for both endpoints", f"{100*combined_min:.2f}–{100*combined_max:.2f}%")
+        st.caption(
+            "Feasible IPS limits are reported in the selected IPS-fraction basis. "
+            "With RBC suspension enabled and carrier basis selected, they refer to the formulated carrier before sample addition."
+        )
 
         warnings = recipe_df.loc[recipe_df["Status"] != "OK", ["Condition", "Endpoint", "IPS fraction [%]", "Warning"]]
         if not warnings.empty:
@@ -763,32 +866,81 @@ with tabs[9]:
 
         st.subheader("Endpoint recipe table")
         display_cols = [
-            "Condition", "Endpoint", "Target density [g/ml]", "IPS fraction [%]",
-            "Nominal endpoint volume [ml]", "Preparation volume incl. excess [ml]",
-            "IPS volume [ml]", "OptiPrep volume [ml]", "PBS volume [ml]",
-            "IPS mass [g]", "OptiPrep mass [g]", "PBS mass [g]",
-            "Calculated density [g/ml]", "Status", "Warning",
+            "Condition", "Endpoint", "Target density [g/ml]",
+            "IPS fraction basis", "IPS fraction [%]",
         ]
+        if include_rbc:
+            display_cols += [
+                "Carrier IPS fraction [%]", "Actual final IPS fraction [%]",
+                "Target RBC fraction [%]", "Sample hematocrit",
+            ]
+        display_cols += [
+            "Nominal endpoint volume [ml]", "Preparation volume incl. excess [ml]",
+        ]
+        if include_rbc:
+            display_cols += ["Carrier volume [ml]"]
+        display_cols += [
+            "IPS volume [ml]", "OptiPrep volume [ml]", "PBS volume [ml]",
+        ]
+        if include_rbc:
+            display_cols += [
+                "RBC suspension volume [ml]", "RBC volume [ml]",
+                f"{sample_liquid_name} volume [ml]",
+            ]
+        display_cols += [
+            "IPS mass [g]", "OptiPrep mass [g]", "PBS mass [g]",
+        ]
+        if include_rbc:
+            display_cols += [
+                "RBC suspension mass estimate [g]",
+                f"{sample_liquid_name} mass [g]",
+                "RBC mass estimate [g]",
+            ]
+        display_cols += ["Calculated density [g/ml]", "Status", "Warning"]
+
+        paired_format = {
+            "Target density [g/ml]": "{:.6f}",
+            "IPS fraction [%]": "{:.3f}",
+            "Carrier IPS fraction [%]": "{:.3f}",
+            "Actual final IPS fraction [%]": "{:.3f}",
+            "Target RBC fraction [%]": "{:.3f}",
+            "Sample hematocrit": "{:.6f}",
+            "Nominal endpoint volume [ml]": "{:.4f}",
+            "Preparation volume incl. excess [ml]": "{:.4f}",
+            "Carrier volume [ml]": "{:.6f}",
+            "IPS volume [ml]": "{:.6f}",
+            "OptiPrep volume [ml]": "{:.6f}",
+            "PBS volume [ml]": "{:.6f}",
+            "RBC suspension volume [ml]": "{:.6f}",
+            "RBC volume [ml]": "{:.6f}",
+            f"{sample_liquid_name} volume [ml]": "{:.6f}",
+            "IPS mass [g]": "{:.6f}",
+            "OptiPrep mass [g]": "{:.6f}",
+            "PBS mass [g]": "{:.6f}",
+            "RBC suspension mass estimate [g]": "{:.6f}",
+            f"{sample_liquid_name} mass [g]": "{:.6f}",
+            "RBC mass estimate [g]": "{:.6f}",
+            "Calculated density [g/ml]": "{:.6f}",
+        }
         st.dataframe(
-            recipe_df[display_cols].style.format({
-                "Target density [g/ml]": "{:.6f}",
-                "IPS fraction [%]": "{:.3f}",
-                "Nominal endpoint volume [ml]": "{:.4f}",
-                "Preparation volume incl. excess [ml]": "{:.4f}",
-                "IPS volume [ml]": "{:.6f}",
-                "OptiPrep volume [ml]": "{:.6f}",
-                "PBS volume [ml]": "{:.6f}",
-                "IPS mass [g]": "{:.6f}",
-                "OptiPrep mass [g]": "{:.6f}",
-                "PBS mass [g]": "{:.6f}",
-                "Calculated density [g/ml]": "{:.6f}",
-            }, na_rep="—"),
+            recipe_df[display_cols].style.format(paired_format, na_rep="—"),
             use_container_width=True,
         )
 
         st.subheader("Total original media required")
+        def available_for_original_medium(name: str) -> float:
+            if name.startswith("IPS"):
+                return avail_ips
+            if name.startswith("OptiPrep"):
+                return avail_opt
+            if name.startswith("1x PBS"):
+                return avail_pbs
+            if name.startswith("RBC suspension"):
+                return avail_sample
+            return 0.0
+
         totals_df["Available [ml]"] = [
-            avail_ips if name.startswith("IPS") else avail_opt if name.startswith("OptiPrep") else avail_pbs
+            available_for_original_medium(name)
             for name in totals_df["Original medium"]
         ]
         totals_df["Remaining [ml]"] = totals_df["Available [ml]"] - totals_df["Total volume needed [ml]"]
@@ -884,6 +1036,16 @@ $$p_{PBS}=1-p_{IPS}-f_{plasma}$$
 For fixed IPS fraction \(P\):
 
 $$O=\frac{\rho_T-P\rho_{IPS}-(1-P)\rho_{PBS}}{\rho_{OptiPrep}-\rho_{PBS}}, \quad B=1-P-O$$
+
+### Paired endpoints with RBC suspension
+
+For final RBC fraction \(c\) and sample hematocrit \(h\):
+
+$$V_{sample}=\frac{cV}{h}, \quad V_{RBC}=cV, \quad V_{sample,liq}=V_{sample}-V_{RBC}$$
+
+The target density is applied to the continuous liquid phase:
+
+$$\rho_T(V-V_{RBC})=V_{IPS}\rho_{IPS}+V_{OptiPrep}\rho_{OptiPrep}+V_{PBS}\rho_{PBS}+V_{sample,liq}\rho_{sample,liq}$$
 
 ### IPS74 osmolarity calculation
 

@@ -14,7 +14,7 @@ The app implements the calculation branches gathered from the uploaded MATLAB sc
 - Ternary IPS/Percoll + OptiPrep + PBS mixing
 - Density correction by adding one stock
 - Low/high gradient endpoint helper
-- Paired low/high endpoint batch for fixed IPS fractions
+- Paired low/high endpoint batch for fixed IPS fractions, optionally including an RBC/blood suspension
 - Tube visualization with stacked component fills and volume marks
 
 ## Scientific assumptions
@@ -24,7 +24,7 @@ The calculator assumes:
 1. Additive volumes.
 2. Linear volume-weighted density mixing.
 3. Mass is `density × volume`.
-4. In the whole-blood mode, the target density is the continuous liquid-phase density after plasma/supernatant addition. RBC volume is excluded from that density balance.
+4. In the whole-blood and paired-endpoint RBC-suspension modes, the target density is the continuous liquid-phase density after plasma/supernatant/sample-medium addition. RBC volume is excluded from that density balance.
 
 For precise RBC work, verify final pH, osmolarity, and density experimentally.
 
@@ -110,6 +110,37 @@ where `P` is the fixed IPS/Percoll-containing fraction, `O` is the OptiPrep frac
 ### Tube visualization implementation
 
 The tube graphic is generated as inline SVG and rendered through `streamlit.components.v1.html()`. This avoids Streamlit/Pillow trying to decode SVG bytes as a raster image on some installations.
+
+
+### Paired endpoints with optional RBC suspension
+
+The paired endpoint tab can optionally include a stock RBC/blood suspension. The user specifies:
+
+- suspension hematocrit,
+- density of the non-RBC suspension medium, such as PBS or plasma,
+- target final RBC volume fraction, either one value for all tubes or one value per IPS condition,
+- whether the requested IPS fractions refer to the formulated carrier excluding the RBC suspension, or to the final total tube mixture.
+
+For final tube volume `V`, final RBC fraction `c`, and sample hematocrit `h`:
+
+```text
+V_sample = c * V / h
+V_RBC = c * V
+V_sample_liquid = V_sample - V_RBC
+V_carrier = V - V_sample
+```
+
+The density target is applied to the final continuous liquid phase:
+
+```text
+rho_target * (V - V_RBC)
+  = V_IPS*rho_IPS
+  + V_OptiPrep*rho_OptiPrep
+  + V_PBS*rho_PBS
+  + V_sample_liquid*rho_sample_liquid
+```
+
+The app reports the required IPS, OptiPrep medium, PBS, and RBC suspension sample volumes and masses, plus total stock usage for the whole experiment.
 
 ## Notes for future extensions
 

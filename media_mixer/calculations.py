@@ -512,19 +512,285 @@ def solve_fixed_ips_ternary_fractions(rho_target: float, p_ips: float, rho_ips: 
     }
 
 
+
+def _blood_sample_fractions(target_rbc_fraction: float, sample_hematocrit: float) -> Dict[str, float]:
+    """Return final-volume fractions for an RBC suspension addition.
+
+    target_rbc_fraction is the desired final RBC volume fraction in the tube.
+    sample_hematocrit is the RBC volume fraction inside the stock blood/RBC suspension.
+    """
+    _validate_fraction("target_rbc_fraction", target_rbc_fraction)
+    _validate_fraction("sample_hematocrit", sample_hematocrit)
+    if sample_hematocrit <= 0:
+        raise ValueError("sample_hematocrit must be positive.")
+    if target_rbc_fraction >= sample_hematocrit:
+        raise ValueError(
+            "target_rbc_fraction must be lower than sample_hematocrit; otherwise no carrier medium can be added."
+        )
+    p_rbc = target_rbc_fraction
+    p_sample_total = p_rbc / sample_hematocrit if p_rbc > 0 else 0.0
+    p_sample_liquid = p_sample_total - p_rbc
+    p_carrier = 1.0 - p_sample_total
+    p_liquid = 1.0 - p_rbc
+    return {
+        "p_rbc": p_rbc,
+        "p_sample_total": p_sample_total,
+        "p_sample_liquid": p_sample_liquid,
+        "p_carrier": p_carrier,
+        "p_liquid": p_liquid,
+    }
+
+
+def _normalise_ips_fraction_basis(ips_fraction_basis: str) -> str:
+    key = (ips_fraction_basis or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "carrier": "carrier",
+        "carrier_excluding_sample": "carrier",
+        "carrier_excluding_rbc_suspension": "carrier",
+        "carrier_before_rbc_suspension": "carrier",
+        "formulated_carrier": "carrier",
+        "final": "final_total",
+        "final_total": "final_total",
+        "final_total_mixture": "final_total",
+        "final_mixture": "final_total",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "ips_fraction_basis must be 'carrier_excluding_sample' or 'final_total_mixture'."
+        )
+    return aliases[key]
+
+
+def feasible_fixed_ips_interval_with_sample(
+    rho_target: float,
+    rho_ips: float,
+    rho_optiprep: float,
+    rho_pbs: float,
+    *,
+    target_rbc_fraction: float = 0.0,
+    sample_hematocrit: float = 0.45,
+    rho_sample_liquid: float = 1.0255,
+    ips_fraction_basis: str = "carrier_excluding_sample",
+) -> Dict[str, float]:
+    """Feasible requested-IPS interval for a density endpoint with optional RBC suspension.
+
+    If ips_fraction_basis is "carrier", the requested IPS fraction is the IPS fraction
+    within the formulated carrier only, excluding the RBC suspension volume.
+
+    If ips_fraction_basis is "final_total", the requested IPS fraction is the final
+    tube-volume fraction including the RBC suspension volume.
+    """
+    if abs(rho_optiprep - rho_pbs) < EPS:
+        raise ValueError("OptiPrep and PBS densities are identical; cannot solve fixed-IPS feasibility.")
+
+    basis = _normalise_ips_fraction_basis(ips_fraction_basis)
+    blood = _blood_sample_fractions(target_rbc_fraction, sample_hematocrit)
+    p_rbc = blood["p_rbc"]
+    p_sample_liquid = blood["p_sample_liquid"]
+    p_carrier = blood["p_carrier"]
+    p_liquid = blood["p_liquid"]
+
+    if p_carrier <= EPS:
+        return {
+            "p_min": float("nan"),
+            "p_max": float("nan"),
+            "feasible": 0.0,
+            "basis": 0.0 if basis == "carrier" else 1.0,
+        }
+
+    denom = rho_optiprep - rho_pbs
+    adjusted_mass_density_term = rho_target * p_liquid - p_sample_liquid * rho_sample_liquid
+
+    if basis == "carrier":
+        # q_opt(x) = a + b*x, q_pbs(x) = 1 - x - q_opt(x)
+        # where x is IPS fraction inside the formulated carrier.
+        lower, upper = 0.0, 1.0
+        a = (adjusted_mass_density_term - p_carrier * rho_pbs) / (p_carrier * denom)
+        b = -(rho_ips - rho_pbs) / denom
+    else:
+        # p_opt(x) = a + b*x, p_pbs(x) = p_carrier - x - p_opt(x)
+        # where x is final total-volume fraction of IPS.
+        lower, upper = 0.0, p_carrier
+        a = (adjusted_mass_density_term - p_carrier * rho_pbs) / denom
+        b = -(rho_ips - rho_pbs) / denom
+
+    # OptiPrep >= 0
+    lo, hi, ok = _linear_ge_interval(a, b)
+    if not ok:
+        feasible = False
+    else:
+        feasible = True
+        if lo is not None:
+            lower = max(lower, lo)
+        if hi is not None:
+            upper = min(upper, hi)
+
+    # PBS >= 0
+    # carrier basis: q_pbs = 1 - x - q_opt = (1-a) + (-1-b)x
+    # final basis:   p_pbs = p_carrier - x - p_opt = (p_carrier-a) + (-1-b)x
+    c = (1.0 - a) if basis == "carrier" else (p_carrier - a)
+    d = -1.0 - b
+    lo, hi, ok = _linear_ge_interval(c, d)
+    if not ok:
+        feasible = False
+    else:
+        if lo is not None:
+            lower = max(lower, lo)
+        if hi is not None:
+            upper = min(upper, hi)
+
+    feasible = feasible and lower <= upper + 1e-9
+    return {
+        "p_min": max(0.0, lower) if feasible else float("nan"),
+        "p_max": min(1.0 if basis == "carrier" else p_carrier, upper) if feasible else float("nan"),
+        "feasible": 1.0 if feasible else 0.0,
+        "basis": 0.0 if basis == "carrier" else 1.0,
+        "p_carrier_fraction_final_volume": p_carrier,
+        "p_sample_total": blood["p_sample_total"],
+        "p_sample_liquid": p_sample_liquid,
+        "p_rbc": p_rbc,
+        "a_opt": a,
+        "b_opt": b,
+    }
+
+
+def solve_fixed_ips_ternary_fractions_with_sample(
+    rho_target: float,
+    ips_fraction: float,
+    rho_ips: float,
+    rho_optiprep: float,
+    rho_pbs: float,
+    *,
+    target_rbc_fraction: float = 0.0,
+    sample_hematocrit: float = 0.45,
+    rho_sample_liquid: float = 1.0255,
+    ips_fraction_basis: str = "carrier_excluding_sample",
+) -> Dict[str, float]:
+    """Solve IPS/OptiPrep/PBS fractions with optional RBC suspension addition."""
+    basis = _normalise_ips_fraction_basis(ips_fraction_basis)
+    blood = _blood_sample_fractions(target_rbc_fraction, sample_hematocrit)
+    p_rbc = blood["p_rbc"]
+    p_sample_total = blood["p_sample_total"]
+    p_sample_liquid = blood["p_sample_liquid"]
+    p_carrier = blood["p_carrier"]
+    p_liquid = blood["p_liquid"]
+
+    interval = feasible_fixed_ips_interval_with_sample(
+        rho_target,
+        rho_ips,
+        rho_optiprep,
+        rho_pbs,
+        target_rbc_fraction=target_rbc_fraction,
+        sample_hematocrit=sample_hematocrit,
+        rho_sample_liquid=rho_sample_liquid,
+        ips_fraction_basis=ips_fraction_basis,
+    )
+
+    if basis == "carrier":
+        _validate_fraction("ips_fraction_in_carrier", ips_fraction)
+        q_ips = ips_fraction
+        if p_carrier <= EPS:
+            raise ValueError("No carrier volume remains after RBC suspension addition.")
+        q_opt = (
+            rho_target * p_liquid
+            - p_sample_liquid * rho_sample_liquid
+            - p_carrier * (q_ips * rho_ips + (1.0 - q_ips) * rho_pbs)
+        ) / (p_carrier * (rho_optiprep - rho_pbs))
+        q_pbs = 1.0 - q_ips - q_opt
+        p_ips_final = p_carrier * q_ips
+        p_opt_final = p_carrier * q_opt
+        p_pbs_final = p_carrier * q_pbs
+        requested_basis_fraction = q_ips
+        carrier_ips_fraction = q_ips
+    else:
+        _validate_fraction("ips_fraction_final_total", ips_fraction)
+        p_ips_final = ips_fraction
+        p_opt_final = (
+            rho_target * p_liquid
+            - p_sample_liquid * rho_sample_liquid
+            - p_ips_final * rho_ips
+            - (p_carrier - p_ips_final) * rho_pbs
+        ) / (rho_optiprep - rho_pbs)
+        p_pbs_final = p_carrier - p_ips_final - p_opt_final
+        carrier_ips_fraction = p_ips_final / p_carrier if p_carrier > EPS else float("nan")
+        q_opt = p_opt_final / p_carrier if p_carrier > EPS else float("nan")
+        q_pbs = p_pbs_final / p_carrier if p_carrier > EPS else float("nan")
+        requested_basis_fraction = p_ips_final
+
+    rho_check = (
+        p_ips_final * rho_ips
+        + p_opt_final * rho_optiprep
+        + p_pbs_final * rho_pbs
+        + p_sample_liquid * rho_sample_liquid
+    ) / p_liquid
+
+    feasible = (
+        interval["feasible"] == 1.0
+        and requested_basis_fraction >= interval["p_min"] - 1e-9
+        and requested_basis_fraction <= interval["p_max"] + 1e-9
+        and p_opt_final >= -1e-9
+        and p_pbs_final >= -1e-9
+        and p_ips_final >= -1e-9
+        and p_carrier >= -1e-9
+    )
+
+    return {
+        "requested_ips_fraction": requested_basis_fraction,
+        "carrier_ips_fraction": carrier_ips_fraction,
+        "carrier_optiprep_fraction": q_opt,
+        "carrier_pbs_fraction": q_pbs,
+        "p_ips": p_ips_final,
+        "p_optiprep": p_opt_final,
+        "p_pbs": p_pbs_final,
+        "p_rbc": p_rbc,
+        "p_sample_total": p_sample_total,
+        "p_sample_liquid": p_sample_liquid,
+        "p_carrier": p_carrier,
+        "p_liquid": p_liquid,
+        "rho_check": rho_check,
+        "feasible": 1.0 if feasible else 0.0,
+        "p_ips_min_feasible": interval["p_min"],
+        "p_ips_max_feasible": interval["p_max"],
+    }
+
+
+def _expand_condition_values(values: Optional[List[float]], n: int, default: float, name: str) -> List[float]:
+    if values is None or len(values) == 0:
+        return [default] * n
+    if len(values) == 1:
+        return values * n
+    if len(values) != n:
+        raise ValueError(f"{name} must contain either one value or exactly {n} values.")
+    return values
+
+
 def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: List[float],
                                    rho_low_target: float, rho_high_target: float,
                                    rho_ips: float, rho_optiprep: float, rho_pbs: float,
-                                   excess_fraction: float = 0.10) -> Dict[str, Any]:
+                                   excess_fraction: float = 0.10,
+                                   *,
+                                   include_rbc_suspension: bool = False,
+                                   target_rbc_fractions: Optional[List[float]] = None,
+                                   sample_hematocrit: float = 0.45,
+                                   rho_sample_liquid: float = 1.0255,
+                                   sample_liquid_name: str = "sample liquid",
+                                   rho_rbc_for_mass: float = 1.100,
+                                   ips_fraction_basis: str = "carrier_excluding_sample") -> Dict[str, Any]:
     """Batch recipe for paired low/high endpoints with fixed IPS fractions.
 
     Each condition receives one low-density endpoint and one high-density endpoint.
-    The low and high endpoint of a condition share the same fixed IPS fraction.
+    The low and high endpoint of a condition share the same requested IPS fraction.
     OptiPrep and PBS are calculated independently for the low/high target densities.
 
-    endpoint_volume_ml is the nominal volume needed per endpoint. The recipe is
+    endpoint_volume_ml is the nominal final volume needed per endpoint. The recipe is
     scaled by (1 + excess_fraction) so users can prepare extra medium for pipette
     dead volume, density checks, or losses.
+
+    If include_rbc_suspension is True, endpoint_volume_ml is interpreted as the final
+    tube mixture volume including RBCs and the stock RBC suspension. The density target
+    is applied to the continuous liquid phase after the sample liquid has been included.
+    RBC volume is excluded from the density denominator, following the blood-aware SDM
+    convention used elsewhere in this app.
     """
     if endpoint_volume_ml <= 0:
         raise ValueError("endpoint_volume_ml must be positive.")
@@ -532,6 +798,16 @@ def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: Lis
         raise ValueError("excess_fraction must be non-negative.")
     if not ips_fractions:
         raise ValueError("At least one IPS fraction is required.")
+
+    basis = _normalise_ips_fraction_basis(ips_fraction_basis)
+    rbc_values = _expand_condition_values(
+        target_rbc_fractions if include_rbc_suspension else [0.0],
+        len(ips_fractions),
+        0.0,
+        "target_rbc_fractions",
+    )
+    if not include_rbc_suspension:
+        rbc_values = [0.0] * len(ips_fractions)
 
     prep_volume_ml = endpoint_volume_ml * (1.0 + excess_fraction)
     targets = [("Low", rho_low_target), ("High", rho_high_target)]
@@ -542,33 +818,84 @@ def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: Lis
         "OptiPrep medium": {"volume_ml": 0.0, "density_g_ml": rho_optiprep, "mass_g": 0.0},
         "1x PBS": {"volume_ml": 0.0, "density_g_ml": rho_pbs, "mass_g": 0.0},
     }
+    if include_rbc_suspension:
+        totals["RBC suspension sample"] = {"volume_ml": 0.0, "density_g_ml": float("nan"), "mass_g": 0.0}
 
-    endpoint_maxima = {
-        name: feasible_fixed_ips_interval_for_density(rho, rho_ips, rho_optiprep, rho_pbs)
-        for name, rho in targets
-    }
+    interval_groups: Dict[str, List[Dict[str, float]]] = {"Low": [], "High": []}
+
+    for endpoint_name, rho_target in targets:
+        for rbc_fraction in rbc_values:
+            interval_groups[endpoint_name].append(
+                feasible_fixed_ips_interval_with_sample(
+                    rho_target,
+                    rho_ips,
+                    rho_optiprep,
+                    rho_pbs,
+                    target_rbc_fraction=rbc_fraction,
+                    sample_hematocrit=sample_hematocrit,
+                    rho_sample_liquid=rho_sample_liquid,
+                    ips_fraction_basis=basis,
+                )
+            )
+
+    endpoint_maxima: Dict[str, Dict[str, float]] = {}
+    for endpoint_name, intervals in interval_groups.items():
+        feasible_intervals = [itv for itv in intervals if itv["feasible"] == 1.0]
+        if feasible_intervals:
+            endpoint_maxima[endpoint_name] = {
+                "p_min": max(itv["p_min"] for itv in feasible_intervals),
+                "p_max": min(itv["p_max"] for itv in feasible_intervals),
+                "feasible": 1.0,
+                "basis": 0.0 if basis == "carrier" else 1.0,
+            }
+            if endpoint_maxima[endpoint_name]["p_min"] > endpoint_maxima[endpoint_name]["p_max"] + 1e-9:
+                endpoint_maxima[endpoint_name]["feasible"] = 0.0
+        else:
+            endpoint_maxima[endpoint_name] = {
+                "p_min": float("nan"),
+                "p_max": float("nan"),
+                "feasible": 0.0,
+                "basis": 0.0 if basis == "carrier" else 1.0,
+            }
+
     combined_p_max = min(endpoint_maxima["Low"]["p_max"], endpoint_maxima["High"]["p_max"])
     combined_p_min = max(endpoint_maxima["Low"]["p_min"], endpoint_maxima["High"]["p_min"])
 
-    for condition_index, p_ips in enumerate(ips_fractions, start=1):
-        _validate_fraction(f"IPS fraction #{condition_index}", p_ips)
-        condition_max = combined_p_max
-        condition_min = combined_p_min
+    for condition_index, (p_ips_request, rbc_fraction) in enumerate(zip(ips_fractions, rbc_values), start=1):
+        _validate_fraction(f"IPS fraction #{condition_index}", p_ips_request)
+        _validate_fraction(f"RBC target fraction #{condition_index}", rbc_fraction)
+
         for endpoint_name, rho_target in targets:
-            solved = solve_fixed_ips_ternary_fractions(
-                rho_target, p_ips, rho_ips, rho_optiprep, rho_pbs
+            solved = solve_fixed_ips_ternary_fractions_with_sample(
+                rho_target,
+                p_ips_request,
+                rho_ips,
+                rho_optiprep,
+                rho_pbs,
+                target_rbc_fraction=rbc_fraction,
+                sample_hematocrit=sample_hematocrit,
+                rho_sample_liquid=rho_sample_liquid,
+                ips_fraction_basis=basis,
             )
             feasible = solved["feasible"] == 1.0
             p_opt = solved["p_optiprep"]
             p_pbs = solved["p_pbs"]
 
             if feasible:
-                v_ips = p_ips * prep_volume_ml
+                v_ips = solved["p_ips"] * prep_volume_ml
                 v_opt = p_opt * prep_volume_ml
                 v_pbs = p_pbs * prep_volume_ml
+                v_rbc = solved["p_rbc"] * prep_volume_ml
+                v_sample = solved["p_sample_total"] * prep_volume_ml
+                v_sample_liquid = solved["p_sample_liquid"] * prep_volume_ml
+                v_carrier = solved["p_carrier"] * prep_volume_ml
+
                 m_ips = v_ips * rho_ips
                 m_opt = v_opt * rho_optiprep
                 m_pbs = v_pbs * rho_pbs
+                m_sample_liquid = v_sample_liquid * rho_sample_liquid
+                m_rbc = v_rbc * rho_rbc_for_mass
+                m_sample = m_sample_liquid + m_rbc if include_rbc_suspension else 0.0
 
                 totals["IPS / Percoll-containing stock"]["volume_ml"] += v_ips
                 totals["IPS / Percoll-containing stock"]["mass_g"] += m_ips
@@ -576,20 +903,30 @@ def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: Lis
                 totals["OptiPrep medium"]["mass_g"] += m_opt
                 totals["1x PBS"]["volume_ml"] += v_pbs
                 totals["1x PBS"]["mass_g"] += m_pbs
+                if include_rbc_suspension:
+                    totals["RBC suspension sample"]["volume_ml"] += v_sample
+                    totals["RBC suspension sample"]["mass_g"] += m_sample
             else:
-                v_ips = v_opt = v_pbs = float("nan")
-                m_ips = m_opt = m_pbs = float("nan")
+                v_ips = v_opt = v_pbs = v_rbc = v_sample = v_sample_liquid = v_carrier = float("nan")
+                m_ips = m_opt = m_pbs = m_sample_liquid = m_rbc = m_sample = float("nan")
 
             max_for_endpoint = solved["p_ips_max_feasible"]
+            min_for_endpoint = solved["p_ips_min_feasible"]
             if feasible:
                 status = "OK"
                 warning = ""
-            elif p_ips > max_for_endpoint:
+            elif p_ips_request > max_for_endpoint:
                 status = "Not feasible"
-                warning = f"IPS fraction too high for {endpoint_name.lower()} endpoint; max is {max_for_endpoint:.6f} ({100*max_for_endpoint:.2f}%)."
-            elif p_ips < solved["p_ips_min_feasible"]:
+                warning = (
+                    f"Requested IPS fraction too high for {endpoint_name.lower()} endpoint; "
+                    f"max is {max_for_endpoint:.6f} ({100*max_for_endpoint:.2f}%) in the selected basis."
+                )
+            elif p_ips_request < min_for_endpoint:
                 status = "Not feasible"
-                warning = f"IPS fraction too low for {endpoint_name.lower()} endpoint; min is {solved['p_ips_min_feasible']:.6f} ({100*solved['p_ips_min_feasible']:.2f}%)."
+                warning = (
+                    f"Requested IPS fraction too low for {endpoint_name.lower()} endpoint; "
+                    f"min is {min_for_endpoint:.6f} ({100*min_for_endpoint:.2f}%) in the selected basis."
+                )
             else:
                 status = "Not feasible"
                 warning = "Target cannot be reached with non-negative OptiPrep and PBS fractions."
@@ -598,28 +935,44 @@ def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: Lis
                 "Condition": condition_index,
                 "Endpoint": endpoint_name,
                 "Target density [g/ml]": rho_target,
-                "IPS fraction": p_ips,
-                "IPS fraction [%]": 100 * p_ips,
+                "Requested IPS fraction": p_ips_request,
+                "IPS fraction [%]": 100 * p_ips_request,
+                "IPS fraction basis": "carrier excluding RBC suspension" if basis == "carrier" else "final total mixture",
+                "Carrier IPS fraction [%]": 100 * solved["carrier_ips_fraction"],
+                "Actual final IPS fraction [%]": 100 * solved["p_ips"],
+                "Target RBC fraction": rbc_fraction,
+                "Target RBC fraction [%]": 100 * rbc_fraction,
+                "Sample hematocrit": sample_hematocrit if include_rbc_suspension else float("nan"),
                 "Nominal endpoint volume [ml]": endpoint_volume_ml,
                 "Preparation volume incl. excess [ml]": prep_volume_ml,
+                "Carrier volume [ml]": v_carrier,
                 "IPS volume [ml]": v_ips,
                 "OptiPrep volume [ml]": v_opt,
                 "PBS volume [ml]": v_pbs,
+                "RBC suspension volume [ml]": v_sample,
+                "RBC volume [ml]": v_rbc,
+                f"{sample_liquid_name} volume [ml]": v_sample_liquid,
                 "IPS mass [g]": m_ips,
                 "OptiPrep mass [g]": m_opt,
                 "PBS mass [g]": m_pbs,
+                "RBC suspension mass estimate [g]": m_sample,
+                f"{sample_liquid_name} mass [g]": m_sample_liquid,
+                "RBC mass estimate [g]": m_rbc,
                 "Calculated density [g/ml]": solved["rho_check"] if feasible else float("nan"),
-                "Feasible IPS min [%]": 100 * solved["p_ips_min_feasible"],
-                "Feasible IPS max [%]": 100 * solved["p_ips_max_feasible"],
+                "Feasible IPS min [%]": 100 * min_for_endpoint,
+                "Feasible IPS max [%]": 100 * max_for_endpoint,
                 "Status": status,
                 "Warning": warning,
             })
 
     total_rows = []
     for name, data in totals.items():
+        density = data["density_g_ml"]
+        if name == "RBC suspension sample" and data["volume_ml"] > EPS:
+            density = data["mass_g"] / data["volume_ml"]
         total_rows.append({
             "Original medium": name,
-            "Density [g/ml]": data["density_g_ml"],
+            "Density [g/ml]": density,
             "Total volume needed [ml]": data["volume_ml"],
             "Total mass needed [g]": data["mass_g"],
         })
@@ -641,6 +994,11 @@ def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: Lis
         "total_preparation_volume_feasible_ml": total_prepared_feasible,
         "combined_feasible_ips_min": combined_p_min,
         "combined_feasible_ips_max": combined_p_max,
+        "include_rbc_suspension": 1.0 if include_rbc_suspension else 0.0,
+        "sample_hematocrit": sample_hematocrit if include_rbc_suspension else 0.0,
+        "rho_sample_liquid_g_ml": rho_sample_liquid if include_rbc_suspension else 0.0,
+        "rho_rbc_for_mass_g_ml": rho_rbc_for_mass if include_rbc_suspension else 0.0,
+        "ips_fraction_basis_code": 0.0 if basis == "carrier" else 1.0,
     }
 
     return {

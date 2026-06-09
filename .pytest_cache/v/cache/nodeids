@@ -1,8 +1,12 @@
 [
   "tests/test_calculations.py::test_blood_mode_volume_balance",
   "tests/test_calculations.py::test_density_correction",
+  "tests/test_calculations.py::test_fixed_ips_feasible_interval_low_density",
   "tests/test_calculations.py::test_ips74_empirical_sums_to_one",
+  "tests/test_calculations.py::test_paired_endpoint_batch_flags_too_high_ips",
+  "tests/test_calculations.py::test_paired_endpoint_batch_with_rbc_suspension_balances_liquid_density",
   "tests/test_calculations.py::test_sdm_ips_pbs_example",
+  "tests/test_calculations.py::test_solve_fixed_ips_with_rbc_suspension_can_flag_too_high_final_fraction",
   "tests/test_calculations.py::test_ternary",
   "tests/test_calculations.py::test_two_endpoint_mix"
 ]
