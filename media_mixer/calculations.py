@@ -7,7 +7,7 @@ an osmometer/pH meter/density meter when high precision is required.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 EPS = 1e-12
 
@@ -424,3 +424,228 @@ def ternary_ips_optiprep_pbs(final_volume_ml: float, rho_target: float, fixed_fr
 
 def rbc_density_gradient_targets(rho_rbc_mean: float, half_width: float = 0.005) -> Dict[str, float]:
     return {"rho_low": rho_rbc_mean - half_width, "rho_high": rho_rbc_mean + half_width}
+
+
+def _linear_ge_interval(c: float, d: float) -> Tuple[Optional[float], Optional[float], bool]:
+    """Return interval contribution for c + d*p >= 0.
+
+    Returns (lower, upper, feasible). None means unbounded on that side.
+    """
+    if abs(d) < EPS:
+        return (None, None, c >= -1e-12)
+    root = -c / d
+    if d > 0:
+        return (root, None, True)
+    return (None, root, True)
+
+
+def feasible_fixed_ips_interval_for_density(rho_target: float, rho_ips: float,
+                                            rho_optiprep: float, rho_pbs: float) -> Dict[str, float]:
+    """Feasible fixed IPS-fraction interval for a ternary IPS/OptiPrep/PBS target.
+
+    For a fixed IPS fraction p, the remaining 1-p is filled by OptiPrep and PBS.
+    This function returns the p interval for which both required OptiPrep and PBS
+    fractions are non-negative.
+    """
+    if abs(rho_optiprep - rho_pbs) < EPS:
+        raise ValueError("OptiPrep and PBS densities are identical; cannot solve fixed-IPS feasibility.")
+
+    # O(p) = a + b*p
+    a = (rho_target - rho_pbs) / (rho_optiprep - rho_pbs)
+    b = -(rho_ips - rho_pbs) / (rho_optiprep - rho_pbs)
+
+    # PBS fraction B(p) = 1 - p - O(p) = c + d*p
+    c = 1.0 - a
+    d = -1.0 - b
+
+    lower, upper = 0.0, 1.0
+    for cc, dd in [(a, b), (c, d)]:
+        lo, hi, ok = _linear_ge_interval(cc, dd)
+        if not ok:
+            return {
+                "p_min": float("nan"),
+                "p_max": float("nan"),
+                "feasible": 0.0,
+                "a_opt": a,
+                "b_opt": b,
+            }
+        if lo is not None:
+            lower = max(lower, lo)
+        if hi is not None:
+            upper = min(upper, hi)
+
+    feasible = lower <= upper + 1e-9
+    return {
+        "p_min": max(0.0, lower),
+        "p_max": min(1.0, upper),
+        "feasible": 1.0 if feasible else 0.0,
+        "a_opt": a,
+        "b_opt": b,
+    }
+
+
+def solve_fixed_ips_ternary_fractions(rho_target: float, p_ips: float, rho_ips: float,
+                                      rho_optiprep: float, rho_pbs: float) -> Dict[str, float]:
+    """Solve OptiPrep/PBS fractions for a fixed IPS fraction and target density."""
+    _validate_fraction("p_ips", p_ips)
+    if abs(rho_optiprep - rho_pbs) < EPS:
+        raise ValueError("OptiPrep and PBS densities are identical; cannot solve ternary mixture.")
+    p_opt = (rho_target - p_ips * rho_ips - (1 - p_ips) * rho_pbs) / (rho_optiprep - rho_pbs)
+    p_pbs = 1.0 - p_ips - p_opt
+    rho_check = p_ips * rho_ips + p_opt * rho_optiprep + p_pbs * rho_pbs
+    interval = feasible_fixed_ips_interval_for_density(rho_target, rho_ips, rho_optiprep, rho_pbs)
+    feasible = (
+        interval["feasible"] == 1.0
+        and p_ips >= interval["p_min"] - 1e-9
+        and p_ips <= interval["p_max"] + 1e-9
+        and p_opt >= -1e-9
+        and p_pbs >= -1e-9
+    )
+    return {
+        "p_ips": p_ips,
+        "p_optiprep": p_opt,
+        "p_pbs": p_pbs,
+        "rho_check": rho_check,
+        "feasible": 1.0 if feasible else 0.0,
+        "p_ips_min_feasible": interval["p_min"],
+        "p_ips_max_feasible": interval["p_max"],
+    }
+
+
+def paired_gradient_endpoint_batch(endpoint_volume_ml: float, ips_fractions: List[float],
+                                   rho_low_target: float, rho_high_target: float,
+                                   rho_ips: float, rho_optiprep: float, rho_pbs: float,
+                                   excess_fraction: float = 0.10) -> Dict[str, Any]:
+    """Batch recipe for paired low/high endpoints with fixed IPS fractions.
+
+    Each condition receives one low-density endpoint and one high-density endpoint.
+    The low and high endpoint of a condition share the same fixed IPS fraction.
+    OptiPrep and PBS are calculated independently for the low/high target densities.
+
+    endpoint_volume_ml is the nominal volume needed per endpoint. The recipe is
+    scaled by (1 + excess_fraction) so users can prepare extra medium for pipette
+    dead volume, density checks, or losses.
+    """
+    if endpoint_volume_ml <= 0:
+        raise ValueError("endpoint_volume_ml must be positive.")
+    if excess_fraction < 0:
+        raise ValueError("excess_fraction must be non-negative.")
+    if not ips_fractions:
+        raise ValueError("At least one IPS fraction is required.")
+
+    prep_volume_ml = endpoint_volume_ml * (1.0 + excess_fraction)
+    targets = [("Low", rho_low_target), ("High", rho_high_target)]
+    rows: List[Dict[str, Any]] = []
+
+    totals = {
+        "IPS / Percoll-containing stock": {"volume_ml": 0.0, "density_g_ml": rho_ips, "mass_g": 0.0},
+        "OptiPrep medium": {"volume_ml": 0.0, "density_g_ml": rho_optiprep, "mass_g": 0.0},
+        "1x PBS": {"volume_ml": 0.0, "density_g_ml": rho_pbs, "mass_g": 0.0},
+    }
+
+    endpoint_maxima = {
+        name: feasible_fixed_ips_interval_for_density(rho, rho_ips, rho_optiprep, rho_pbs)
+        for name, rho in targets
+    }
+    combined_p_max = min(endpoint_maxima["Low"]["p_max"], endpoint_maxima["High"]["p_max"])
+    combined_p_min = max(endpoint_maxima["Low"]["p_min"], endpoint_maxima["High"]["p_min"])
+
+    for condition_index, p_ips in enumerate(ips_fractions, start=1):
+        _validate_fraction(f"IPS fraction #{condition_index}", p_ips)
+        condition_max = combined_p_max
+        condition_min = combined_p_min
+        for endpoint_name, rho_target in targets:
+            solved = solve_fixed_ips_ternary_fractions(
+                rho_target, p_ips, rho_ips, rho_optiprep, rho_pbs
+            )
+            feasible = solved["feasible"] == 1.0
+            p_opt = solved["p_optiprep"]
+            p_pbs = solved["p_pbs"]
+
+            if feasible:
+                v_ips = p_ips * prep_volume_ml
+                v_opt = p_opt * prep_volume_ml
+                v_pbs = p_pbs * prep_volume_ml
+                m_ips = v_ips * rho_ips
+                m_opt = v_opt * rho_optiprep
+                m_pbs = v_pbs * rho_pbs
+
+                totals["IPS / Percoll-containing stock"]["volume_ml"] += v_ips
+                totals["IPS / Percoll-containing stock"]["mass_g"] += m_ips
+                totals["OptiPrep medium"]["volume_ml"] += v_opt
+                totals["OptiPrep medium"]["mass_g"] += m_opt
+                totals["1x PBS"]["volume_ml"] += v_pbs
+                totals["1x PBS"]["mass_g"] += m_pbs
+            else:
+                v_ips = v_opt = v_pbs = float("nan")
+                m_ips = m_opt = m_pbs = float("nan")
+
+            max_for_endpoint = solved["p_ips_max_feasible"]
+            if feasible:
+                status = "OK"
+                warning = ""
+            elif p_ips > max_for_endpoint:
+                status = "Not feasible"
+                warning = f"IPS fraction too high for {endpoint_name.lower()} endpoint; max is {max_for_endpoint:.6f} ({100*max_for_endpoint:.2f}%)."
+            elif p_ips < solved["p_ips_min_feasible"]:
+                status = "Not feasible"
+                warning = f"IPS fraction too low for {endpoint_name.lower()} endpoint; min is {solved['p_ips_min_feasible']:.6f} ({100*solved['p_ips_min_feasible']:.2f}%)."
+            else:
+                status = "Not feasible"
+                warning = "Target cannot be reached with non-negative OptiPrep and PBS fractions."
+
+            rows.append({
+                "Condition": condition_index,
+                "Endpoint": endpoint_name,
+                "Target density [g/ml]": rho_target,
+                "IPS fraction": p_ips,
+                "IPS fraction [%]": 100 * p_ips,
+                "Nominal endpoint volume [ml]": endpoint_volume_ml,
+                "Preparation volume incl. excess [ml]": prep_volume_ml,
+                "IPS volume [ml]": v_ips,
+                "OptiPrep volume [ml]": v_opt,
+                "PBS volume [ml]": v_pbs,
+                "IPS mass [g]": m_ips,
+                "OptiPrep mass [g]": m_opt,
+                "PBS mass [g]": m_pbs,
+                "Calculated density [g/ml]": solved["rho_check"] if feasible else float("nan"),
+                "Feasible IPS min [%]": 100 * solved["p_ips_min_feasible"],
+                "Feasible IPS max [%]": 100 * solved["p_ips_max_feasible"],
+                "Status": status,
+                "Warning": warning,
+            })
+
+    total_rows = []
+    for name, data in totals.items():
+        total_rows.append({
+            "Original medium": name,
+            "Density [g/ml]": data["density_g_ml"],
+            "Total volume needed [ml]": data["volume_ml"],
+            "Total mass needed [g]": data["mass_g"],
+        })
+
+    total_nominal = endpoint_volume_ml * 2 * len(ips_fractions)
+    total_prepared_requested = prep_volume_ml * 2 * len(ips_fractions)
+    feasible_endpoint_count = sum(1 for row in rows if row["Status"] == "OK")
+    total_prepared_feasible = prep_volume_ml * feasible_endpoint_count
+
+    summary = {
+        "nominal_endpoint_volume_ml": endpoint_volume_ml,
+        "preparation_endpoint_volume_ml": prep_volume_ml,
+        "excess_fraction": excess_fraction,
+        "number_conditions": len(ips_fractions),
+        "number_endpoints_requested": 2 * len(ips_fractions),
+        "number_endpoints_feasible": feasible_endpoint_count,
+        "total_nominal_endpoint_volume_requested_ml": total_nominal,
+        "total_preparation_volume_requested_ml": total_prepared_requested,
+        "total_preparation_volume_feasible_ml": total_prepared_feasible,
+        "combined_feasible_ips_min": combined_p_min,
+        "combined_feasible_ips_max": combined_p_max,
+    }
+
+    return {
+        "recipe_rows": rows,
+        "total_rows": total_rows,
+        "summary": summary,
+        "endpoint_feasible_intervals": endpoint_maxima,
+    }

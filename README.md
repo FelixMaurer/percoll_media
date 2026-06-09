@@ -14,6 +14,7 @@ The app implements the calculation branches gathered from the uploaded MATLAB sc
 - Ternary IPS/Percoll + OptiPrep + PBS mixing
 - Density correction by adding one stock
 - Low/high gradient endpoint helper
+- Paired low/high endpoint batch for fixed IPS fractions
 - Tube visualization with stacked component fills and volume marks
 
 ## Scientific assumptions
@@ -83,6 +84,18 @@ f_plasma = V_plasma / V_liquid
 p_IPS = (rho_target - rho_PBS - f_plasma * (rho_plasma - rho_PBS)) / (rho_IPS - rho_PBS)
 p_PBS = 1 - p_IPS - f_plasma
 ```
+
+
+### Paired low/high endpoint batch
+
+This mode is for experiments where each condition has a fixed IPS fraction, and each condition needs a low-density and high-density endpoint of the same IPS fraction. The app solves OptiPrep and PBS fractions for each endpoint:
+
+```text
+O = (rho_target - P*rho_IPS - (1-P)*rho_PBS) / (rho_OptiPrep - rho_PBS)
+B = 1 - P - O
+```
+
+If the fixed IPS fraction is too high or too low for a target density, the table marks the row as not feasible and reports the feasible IPS range for that endpoint. The batch export includes endpoint recipes, component masses, and total original media required.
 
 ### Ternary IPS/Percoll + OptiPrep + PBS
 

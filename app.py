@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import datetime
 from html import escape
 
@@ -18,6 +19,7 @@ from media_mixer.calculations import (
     optiprep_endpoint_fibrinogen,
     optiprep_table_density,
     optiprep_working_solution,
+    paired_gradient_endpoint_batch,
     rbc_density_gradient_targets,
     sdm_ips_pbs,
     sdm_with_whole_blood,
@@ -323,6 +325,72 @@ def make_protocol_text(result: MixResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_fraction_list(raw: str) -> list[float]:
+    """Parse comma/newline/semicolon-separated fractions.
+
+    Values > 1 are interpreted as percentages, e.g. 50 -> 0.50.
+    """
+    tokens = [tok.strip() for tok in re.split(r"[,;\n\t ]+", raw) if tok.strip()]
+    fractions: list[float] = []
+    for tok in tokens:
+        tok = tok.replace("%", "")
+        value = float(tok)
+        if value > 1:
+            value = value / 100.0
+        if not 0 <= value <= 1:
+            raise ValueError(f"Fraction {tok!r} is outside 0–1 / 0–100%.")
+        fractions.append(value)
+    if not fractions:
+        raise ValueError("Enter at least one IPS fraction.")
+    return fractions
+
+
+def make_paired_endpoint_protocol_text(recipe_df: pd.DataFrame, totals_df: pd.DataFrame, summary: dict, intervals: dict) -> str:
+    lines = []
+    lines.append("Paired low/high gradient endpoint batch")
+    lines.append("=======================================")
+    lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+    lines.append("Summary")
+    lines.append("-------")
+    for key, value in summary.items():
+        if isinstance(value, float):
+            lines.append(f"- {key}: {value:.10g}")
+        else:
+            lines.append(f"- {key}: {value}")
+    lines.append("")
+    lines.append("Feasible fixed-IPS intervals")
+    lines.append("----------------------------")
+    for endpoint, interval in intervals.items():
+        lines.append(
+            f"- {endpoint}: {100*interval['p_min']:.4f}% to {100*interval['p_max']:.4f}% IPS"
+        )
+    lines.append("")
+    lines.append("Endpoint recipes")
+    lines.append("----------------")
+    for _, row in recipe_df.iterrows():
+        lines.append(
+            f"Condition {int(row['Condition'])}, {row['Endpoint']} endpoint, "
+            f"target density {row['Target density [g/ml]']:.6f} g/ml, "
+            f"IPS {row['IPS fraction [%]']:.3f}%: {row['Status']}"
+        )
+        if row["Status"] == "OK":
+            lines.append(f"  - IPS:       {row['IPS volume [ml]']:.6f} ml = {row['IPS mass [g]']:.6f} g")
+            lines.append(f"  - OptiPrep:  {row['OptiPrep volume [ml]']:.6f} ml = {row['OptiPrep mass [g]']:.6f} g")
+            lines.append(f"  - PBS:       {row['PBS volume [ml]']:.6f} ml = {row['PBS mass [g]']:.6f} g")
+        else:
+            lines.append(f"  - Warning: {row['Warning']}")
+    lines.append("")
+    lines.append("Total original media required")
+    lines.append("-----------------------------")
+    for _, row in totals_df.iterrows():
+        lines.append(
+            f"- {row['Original medium']}: {row['Total volume needed [ml]']:.6f} ml "
+            f"= {row['Total mass needed [g]']:.6f} g"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def common_density_inputs():
     st.caption("Use measured densities at the working temperature whenever possible.")
     c1, c2, c3 = st.columns(3)
@@ -370,6 +438,7 @@ tabs = st.tabs([
     "Percoll + OptiPrep",
     "Density correction",
     "Gradient helper",
+    "Paired endpoints",
     "Formula reference",
 ])
 
@@ -597,6 +666,197 @@ with tabs[8]:
     st.info("For a prepared linear gradient, make low and high endpoint media with matched additive concentrations, then pump with complementary flow profiles.")
 
 with tabs[9]:
+    st.header("Paired low/high endpoint batch")
+    st.write(
+        "Prepare paired low- and high-density endpoint media for several tubes. "
+        "Each tube/condition keeps the same fixed IPS fraction in both endpoints; "
+        "OptiPrep medium and PBS are solved separately for the low and high target densities."
+    )
+
+    c1, c2, c3 = st.columns([1.15, 1, 1])
+    with c1:
+        fractions_raw = st.text_area(
+            "IPS fractions for conditions",
+            "50, 60, 75, 87",
+            help="Enter comma/newline-separated values. 50 means 50%; 0.5 also works.",
+            key="paired_fractions",
+        )
+        endpoint_volume = st.number_input(
+            "Nominal volume needed per endpoint [ml]",
+            0.001, 10000.0, 6.0, 0.5, key="paired_endpoint_volume"
+        )
+        excess_percent = st.number_input(
+            "Preparation excess [%]",
+            0.0, 200.0, 10.0, 1.0,
+            help="Scales each endpoint recipe. 10% means prepare 6.6 ml when 6 ml are needed.",
+            key="paired_excess_percent",
+        )
+    with c2:
+        rho_low = st.number_input(
+            "Low endpoint density [g/ml]",
+            0.5, 2.0, 1.0950, 0.0001, format="%.6f", key="paired_rho_low"
+        )
+        rho_high = st.number_input(
+            "High endpoint density [g/ml]",
+            0.5, 2.0, 1.1090, 0.0001, format="%.6f", key="paired_rho_high"
+        )
+        st.caption("Low and high density are applied to every condition.")
+    with c3:
+        rho_ips = st.number_input(
+            "ρ IPS [g/ml]",
+            0.5, 2.0, DEFAULTS["rho_ips74"], 0.0001, format="%.6f", key="paired_rho_ips"
+        )
+        rho_opt = st.number_input(
+            "ρ OptiPrep medium [g/ml]",
+            0.5, 2.0, DEFAULTS["rho_optiprep_40"], 0.0001, format="%.6f", key="paired_rho_opt"
+        )
+        rho_pbs = st.number_input(
+            "ρ PBS [g/ml]",
+            0.5, 2.0, DEFAULTS["rho_pbs"], 0.0001, format="%.6f", key="paired_rho_pbs"
+        )
+
+    st.subheader("Available stock volumes")
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        avail_ips = st.number_input("Available IPS [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_ips")
+    with a2:
+        avail_opt = st.number_input("Available OptiPrep medium [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_opt")
+    with a3:
+        avail_pbs = st.number_input("Available PBS [ml]", 0.0, 100000.0, 100.0, 1.0, key="paired_avail_pbs")
+
+    try:
+        ips_fractions = parse_fraction_list(fractions_raw)
+        batch = paired_gradient_endpoint_batch(
+            endpoint_volume_ml=endpoint_volume,
+            ips_fractions=ips_fractions,
+            rho_low_target=rho_low,
+            rho_high_target=rho_high,
+            rho_ips=rho_ips,
+            rho_optiprep=rho_opt,
+            rho_pbs=rho_pbs,
+            excess_fraction=excess_percent / 100.0,
+        )
+        recipe_df = pd.DataFrame(batch["recipe_rows"])
+        totals_df = pd.DataFrame(batch["total_rows"])
+        summary = batch["summary"]
+        intervals = batch["endpoint_feasible_intervals"]
+
+        st.subheader("Feasibility")
+        low_interval = intervals["Low"]
+        high_interval = intervals["High"]
+        combined_min = summary["combined_feasible_ips_min"]
+        combined_max = summary["combined_feasible_ips_max"]
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Low endpoint feasible IPS", f"{100*low_interval['p_min']:.2f}–{100*low_interval['p_max']:.2f}%")
+        f2.metric("High endpoint feasible IPS", f"{100*high_interval['p_min']:.2f}–{100*high_interval['p_max']:.2f}%")
+        f3.metric("Feasible for both endpoints", f"{100*combined_min:.2f}–{100*combined_max:.2f}%")
+
+        warnings = recipe_df.loc[recipe_df["Status"] != "OK", ["Condition", "Endpoint", "IPS fraction [%]", "Warning"]]
+        if not warnings.empty:
+            st.error(
+                "Some requested IPS fractions are not feasible with the chosen densities. "
+                "The table gives the maximum/minimum feasible IPS fraction for each endpoint."
+            )
+            st.dataframe(warnings, use_container_width=True)
+        else:
+            st.success("All requested endpoint recipes are feasible with non-negative IPS, OptiPrep, and PBS volumes.")
+
+        st.subheader("Endpoint recipe table")
+        display_cols = [
+            "Condition", "Endpoint", "Target density [g/ml]", "IPS fraction [%]",
+            "Nominal endpoint volume [ml]", "Preparation volume incl. excess [ml]",
+            "IPS volume [ml]", "OptiPrep volume [ml]", "PBS volume [ml]",
+            "IPS mass [g]", "OptiPrep mass [g]", "PBS mass [g]",
+            "Calculated density [g/ml]", "Status", "Warning",
+        ]
+        st.dataframe(
+            recipe_df[display_cols].style.format({
+                "Target density [g/ml]": "{:.6f}",
+                "IPS fraction [%]": "{:.3f}",
+                "Nominal endpoint volume [ml]": "{:.4f}",
+                "Preparation volume incl. excess [ml]": "{:.4f}",
+                "IPS volume [ml]": "{:.6f}",
+                "OptiPrep volume [ml]": "{:.6f}",
+                "PBS volume [ml]": "{:.6f}",
+                "IPS mass [g]": "{:.6f}",
+                "OptiPrep mass [g]": "{:.6f}",
+                "PBS mass [g]": "{:.6f}",
+                "Calculated density [g/ml]": "{:.6f}",
+            }, na_rep="—"),
+            use_container_width=True,
+        )
+
+        st.subheader("Total original media required")
+        totals_df["Available [ml]"] = [
+            avail_ips if name.startswith("IPS") else avail_opt if name.startswith("OptiPrep") else avail_pbs
+            for name in totals_df["Original medium"]
+        ]
+        totals_df["Remaining [ml]"] = totals_df["Available [ml]"] - totals_df["Total volume needed [ml]"]
+        totals_df["Enough stock?"] = totals_df["Remaining [ml]"] >= -1e-9
+
+        st.dataframe(
+            totals_df.style.format({
+                "Density [g/ml]": "{:.6f}",
+                "Total volume needed [ml]": "{:.6f}",
+                "Total mass needed [g]": "{:.6f}",
+                "Available [ml]": "{:.3f}",
+                "Remaining [ml]": "{:.3f}",
+            }),
+            use_container_width=True,
+        )
+
+        if not totals_df["Enough stock?"].all():
+            st.warning("At least one original medium is insufficient for the feasible recipes shown above.")
+        else:
+            st.info(
+                f"Requested nominal endpoint volume: {summary['total_nominal_endpoint_volume_requested_ml']:.3f} ml. "
+                f"Feasible prepared volume including excess: {summary['total_preparation_volume_feasible_ml']:.3f} ml "
+                f"({int(summary['number_endpoints_feasible'])}/{int(summary['number_endpoints_requested'])} endpoints feasible)."
+            )
+
+        # Downloads
+        protocol_text = make_paired_endpoint_protocol_text(recipe_df, totals_df, summary, intervals)
+        csv_recipe = recipe_df.to_csv(index=False).encode("utf-8")
+        csv_totals = totals_df.to_csv(index=False).encode("utf-8")
+        combined_csv = (
+            "# Endpoint recipes\n" + recipe_df.to_csv(index=False) +
+            "\n# Total original media required\n" + totals_df.to_csv(index=False)
+        ).encode("utf-8")
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button(
+                "Download full protocol .txt",
+                protocol_text,
+                file_name=f"paired_gradient_endpoint_protocol_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                mime="text/plain",
+            )
+        with d2:
+            st.download_button(
+                "Download endpoint recipe CSV",
+                csv_recipe,
+                file_name=f"paired_gradient_endpoint_recipes_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+            )
+        with d3:
+            st.download_button(
+                "Download totals CSV",
+                csv_totals,
+                file_name=f"paired_gradient_endpoint_totals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+            )
+        st.download_button(
+            "Download combined CSV",
+            combined_csv,
+            file_name=f"paired_gradient_endpoint_full_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+
+    except Exception as e:
+        st.error(str(e))
+
+
+with tabs[10]:
     st.header("Formula reference")
     st.markdown(r"""
 ### Two-component density mixing
